@@ -97,6 +97,10 @@ class BleDfuControllerSecure(NrfBleDfuController):
 
         self._dfu_send_init()
 
+        if self.mtu > 23:
+            self.pkt_payload_size = min(62,self.mtu-3)
+            self.pkt_receipt_interval = 4096 // self.pkt_payload_size + min(1,4096 % self.pkt_payload_size) # once per page
+            print "MTU: %d, packet size: %d" % (self.mtu,self.pkt_payload_size)
         self._dfu_send_image()
 
     # --------------------------------------------------------------------------
@@ -258,8 +262,13 @@ class BleDfuControllerSecure(NrfBleDfuController):
         obj_offset = (offset/max_size)*max_size
         while(obj_offset < self.image_size):
             # print "\nSending object {} of {}".format(obj_offset/max_size+1, num_objects)
-            obj_offset += self._dfu_send_object(obj_offset, max_size)
-
+            try:
+                obj_offset += self._dfu_send_object(obj_offset, max_size)
+            except Exception as e:
+                self._dfu_send_command(Procedures.SELECT, [Procedures.PARAM_DATA])
+                (proc, res, max_size, offset, crc32) = self._wait_and_parse_notify()
+                obj_offset = (offset/max_size)*max_size
+                print "Restarting at offset %d" % offset
         # Image uploaded successfully, update the progress bar
         print_progress(self.image_size, self.image_size, prefix = 'Progress:', suffix = 'Complete', barLength = 50)
 
@@ -275,13 +284,20 @@ class BleDfuControllerSecure(NrfBleDfuController):
                 # Create Data Object
                 size = min(obj_max_size, self.image_size - offset)
                 self._dfu_send_command(Procedures.CREATE, [Procedures.PARAM_DATA] + uint32_to_bytes_le(size))
-                self._wait_and_parse_notify()
+                try:
+                    self._wait_and_parse_notify()
+                except Exception as e:
+                    # Likely no notification received, need to re-transmit object
+                    print "\nNo reply for CREATE command, retrying"
+                    raise e
+                    #return 0
 
             segment_count = 0
             segment_total = int(math.ceil(min(obj_max_size, self.image_size-offset)/float(self.pkt_payload_size)))
 
             segment_begin = offset
             segment_end = min(offset+obj_max_size, self.image_size)
+            crcdone=False
 
             for i in range(segment_begin, segment_end, self.pkt_payload_size):
                 num_bytes = min(self.pkt_payload_size, segment_end - i)
@@ -295,29 +311,43 @@ class BleDfuControllerSecure(NrfBleDfuController):
                 if (segment_count % self.pkt_receipt_interval) == 0:
                     try:
                         (proc, res, offset, crc32) = self._wait_and_parse_notify()
-                    except e:
+                    except Exception as e:
                         # Likely no notification received, need to re-transmit object
-                        return 0
+                        print "\nNo reply when sending data, retrying"
+                        raise e
+                        #return 0
 
                     if res != Results.SUCCESS:
                         raise Exception("bad notification status: {}".format(Results.to_string(res)))
 
                     if crc32 != crc32_unsigned(self.bin_array[0:offset]):
                         # Something went wrong, need to re-transmit this object
-                        return 0
+                        print "\nCRC check failed, retrying"
+                        raise Exception("CRC check failed")
+                        #return 0
+                    crcdone=True
 
                     print_progress(offset, self.image_size, prefix = 'Progress:', suffix = 'Complete', barLength = 50)
 
-            # Calculate CRC
-            self._dfu_send_command(Procedures.CALC_CHECKSUM)
-            (proc, res, offset, crc32) = self._wait_and_parse_notify()
-            if(crc32 != crc32_unsigned(self.bin_array[0:offset])):
-                # Need to re-transmit object
-                return 0
+            if not crcdone:
+                # Calculate CRC
+                self._dfu_send_command(Procedures.CALC_CHECKSUM)
+                (proc, res, offset, crc32) = self._wait_and_parse_notify()
+                if(crc32 != crc32_unsigned(self.bin_array[0:offset])):
+                    # Need to re-transmit object
+                    print "\nCRC check failed, retrying"
+                    raise Exception("CRC check failed")
+                    #return 0
 
         # Execute command
         self._dfu_send_command(Procedures.EXECUTE)
-        self._wait_and_parse_notify()
+        try:
+        	self._wait_and_parse_notify()
+        except Exception as e:
+            # Likely no notification received, need to re-transmit object
+            print "\nNo reply for EXECUTE command, retrying"
+            raise e
+            #return 0
 
         # If everything executed correctly, return amount of bytes transfered
         return obj_max_size

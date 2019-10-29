@@ -121,7 +121,7 @@ class NrfBleDfuController(object):
     # Perform a scan and connect via gatttool.
     # Will return True if a connection was established, False otherwise
     # --------------------------------------------------------------------------
-    def scan_and_connect(self, timeout=2):
+    def scan_and_connect(self, timeout=2, mtu=185):
         if verbose: print "scan_and_connect"
 
         print "Connecting to %s" % (self.target_mac)
@@ -137,6 +137,14 @@ class NrfBleDfuController(object):
             res = self.ble_conn.expect('.*Connection successful.*', timeout=timeout)
         except pexpect.TIMEOUT, e:
             return False
+        if mtu>23:
+            #MTU negotiation
+            self.ble_conn.sendline('mtu %d' % mtu)
+            res=self.ble_conn.expect('.*MTU was exchanged successfully: (.+)\r.*', timeout=timeout)
+            res=re.findall('.*MTU was exchanged successfully: (.+)\r.*',self.ble_conn.after)
+            self.mtu=int(res[0])
+        else:
+            self.mtu=mtu
 
         return True
 
@@ -186,7 +194,7 @@ class NrfBleDfuController(object):
                 return None
 
             try:
-                index = self.ble_conn.expect('Notification handle = .*? \r\n', timeout=30)
+                index = self.ble_conn.expect('Notification handle = .*? \r\n', timeout=5)
 
             except pexpect.TIMEOUT:
                 #
